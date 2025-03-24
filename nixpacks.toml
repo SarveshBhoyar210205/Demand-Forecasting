@@ -1,8 +1,10 @@
+providers = ["python"]  # Tell Nixpacks to use Python
+
 [phases.setup]
-nixPkgs = ["python39", "pip", "gunicorn"]
+nixPkgs = ["python39", "pip"]
 
 [phases.build]
 cmds = ["pip install -r requirements.txt"]
 
 [start]
-cmds = "gunicorn app:app --bind 0.0.0.0:$PORT"
+cmd = "python web.py"

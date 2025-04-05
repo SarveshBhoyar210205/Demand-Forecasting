@@ -1,97 +1,120 @@
-from flask import Flask, jsonify, request
-import pandas as pd
-import joblib
-import os
-import datetime
-import requests
+from flask import Flask, request, jsonify
 from flask_cors import CORS
+import requests
 
 app = Flask(__name__)
-CORS(app, resources={r"/predict": {"origins": "http://localhost:3000"}})
 
-# Google Drive file links
-MODEL_URL = "https://drive.google.com/uc?export=download&id=12v42hELSYSM5NAt10m-qPrvfTw1Qf6VR"
-FEATURES_URL = "https://drive.google.com/uc?export=download&id=1griXJTzjdASVfdRXXiUHQU9K9UUnRm_F"
+# ✅ Enable CORS for frontend access
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Local paths
-MODEL_PATH = "best_demand_forecast_model.pkl"
-FEATURES_PATH = "feature_names.pkl"
+# ✅ Google APIs
+GOOGLE_MAPS_API_KEY = "AIzaSyCrTX-gRHbf-ZQ_k5Ji61IqrQENwJ7RUfA"
+ROUTES_API_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
+AIR_QUALITY_API_URL = "https://airquality.googleapis.com/v1/currentConditions:lookup"
 
-# Function to download model if not present
-def download_file(url, save_path):
-    if not os.path.exists(save_path):
-        print(f"Downloading {save_path}...")
-        response = requests.get(url, stream=True)
-        with open(save_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=1024):
-                if chunk:
-                    f.write(chunk)
-        print(f"✅ {save_path} downloaded successfully!")
+### 🚀 1️⃣ GET ALTERNATIVE ROUTES
+@app.route("/get-alternative-routes", methods=["POST"])
+def get_alternative_routes():
+    data = request.json
+    origin = data.get("origin")
+    destination = data.get("destination")
+    
+    if not origin or not destination:
+        return jsonify({"success": False, "error": "Missing origin or destination"}), 400
 
-# Ensure the model and feature names exist
-download_file(MODEL_URL, MODEL_PATH)
-download_file(FEATURES_URL, FEATURES_PATH)
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+        "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.polyline,routes.legs"
+    }
 
-# Load the model and features
-model = joblib.load(MODEL_PATH)
-expected_features = joblib.load(FEATURES_PATH)
-print("✅ Model and features loaded successfully!")
-
-@app.route('/predict', methods=['GET'])
-def predict():
-    if model is None:
-        return jsonify({"error": "Model not found. Check the download link!"}), 500
-
-    store_id = request.args.get('store_id')
-    sku_id = request.args.get('sku_id')
-    date_str = request.args.get('date')
-    current_stock = request.args.get('current_stock')
-
-    if not store_id or not sku_id or current_stock is None:
-        return jsonify({"error": "Please provide store_id, sku_id, and current_stock"}), 400
-
-    try:
-        current_stock = int(current_stock)
-    except ValueError:
-        return jsonify({"error": "Invalid current_stock value. It must be an integer."}), 400
-
-    if not date_str:
-        today = datetime.date.today()
-        next_week = today + datetime.timedelta(days=7)
-        date_str = next_week.strftime('%Y-%m-%d')
-
-    day, month, year = map(int, date_str.split('-'))
-
-    input_data = pd.DataFrame([{"day": day, "month": month, "year": year}])
-
-    for feature in expected_features:
-        if feature.startswith("store_"):
-            input_data[feature] = 1 if feature == f"store_{store_id}" else 0
-        elif feature.startswith("sku_"):
-            input_data[feature] = 1 if feature == f"sku_{sku_id}" else 0
-        elif feature not in input_data.columns:
-            input_data[feature] = 0
-
-    input_data = input_data[expected_features]
+    body = {
+        "origin": {
+            "location": {
+                "latLng": {
+                    "latitude": origin["latitude"],
+                    "longitude": origin["longitude"]
+                }
+            }
+        },
+        "destination": {
+            "location": {
+                "latLng": {
+                    "latitude": destination["latitude"],
+                    "longitude": destination["longitude"]
+                }
+            }
+        },
+        "travelMode": "DRIVE",
+        "computeAlternativeRoutes": True,
+        "routingPreference": "TRAFFIC_AWARE_OPTIMAL"
+    }
 
     try:
-        predicted_sales = model.predict(input_data)[0]
-        predicted_sales = round(predicted_sales, 2)
+        response = requests.post(ROUTES_API_URL, json=body, headers=headers)
+        
+        # Debugging: Log the API response
+        print("API Response: ", response.json())  # Print the entire response to check
 
-        if current_stock < predicted_sales:
-            recommended_restock = round(predicted_sales - current_stock)
+        if response.status_code == 200:
+            routes = response.json().get("routes", [])
+            if routes:
+                return jsonify({"success": True, "routes": routes})
+            else:
+                return jsonify({"success": False, "error": "No valid routes found"}), 404
         else:
-            recommended_restock = "Sufficient stock"
+            return jsonify({"success": False, "error": response.text}), response.status_code
 
-        return jsonify({
-            "store_id": store_id,
-            "sku_id": sku_id,
-            "predicted_sales": predicted_sales,
-            "current_stock": current_stock,
-            "recommended_restock": recommended_restock
-        })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print("Error occurred while fetching routes: ", e)  # Log the error
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+### 🌍 2️⃣ GET AIR QUALITY FROM GOOGLE API
+@app.route("/get-air-quality", methods=["POST"])
+def get_air_quality():
+    data = request.json
+    route_points = data.get("route_points")
+
+    if not route_points:
+        return jsonify({"success": False, "error": "No route points provided"}), 400
+
+    aqi_values = []
+
+    for point in route_points:
+        lat, lng = point["lat"], point["lng"]
+        
+        # ✅ Fetch AQI using Google Air Quality API
+        try:
+            response = requests.get(f"{AIR_QUALITY_API_URL}?key={GOOGLE_MAPS_API_KEY}&location.latitude={lat}&location.longitude={lng}")
+            
+            # Debugging: Log the API response
+            print("Air Quality API Response: ", response.json())  # Log AQI response
+            
+            if response.status_code == 200:
+                aqi_data = response.json()
+                if "indexes" in aqi_data and len(aqi_data["indexes"]) > 0:
+                    aqi = aqi_data["indexes"][0]["aqi"]
+                    aqi_values.append(aqi)
+        except Exception as e:
+            print(f"Error fetching AQI for point {lat}, {lng}: {e}")
+            continue
+
+    if aqi_values:
+        avg_aqi = sum(aqi_values) / len(aqi_values)
+        return jsonify({"success": True, "average_aqi": avg_aqi, "aqi_values": aqi_values})
+    else:
+        return jsonify({"success": False, "error": "No AQI data found"}), 404
+
+
+### ✅ ALLOW CORS FOR OPTIONS REQUESTS
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return response
+
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True)
